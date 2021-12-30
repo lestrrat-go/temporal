@@ -108,19 +108,19 @@ func (s *defaultClaimMapperSuite) testTokenGenerator(alg keyAlgorithm) {
 	tokenString, err := s.tokenGenerator.generateToken(alg,
 		testSubject, permissionsAdmin, errorTestOptionNoError)
 	s.NoError(err)
-	claims, err := parseJWT(tokenString, s.tokenGenerator)
+	tok, err := parseJWT(tokenString, s.tokenGenerator)
 	s.NoError(err)
-	s.Equal(testSubject, claims["sub"])
+	s.Equal(testSubject, tok.Subject())
 }
 
 func (s *defaultClaimMapperSuite) TestTokenWithNoSubject() {
 	tokenString, err := s.tokenGenerator.generateRSAToken(
 		testSubject, permissionsAdmin, errorTestOptionNoSubject)
 	s.NoError(err)
-	claims, err := parseJWT(tokenString, s.tokenGenerator)
+	tok, err := parseJWT(tokenString, s.tokenGenerator)
 	s.NoError(err)
-	subject := claims["sub"]
-	s.Nil(subject)
+	subject := tok.Subject()
+	s.Equal("", subject)
 }
 func (s *defaultClaimMapperSuite) TestTokenWithNoKID() {
 	tokenString, err := s.tokenGenerator.generateRSAToken(

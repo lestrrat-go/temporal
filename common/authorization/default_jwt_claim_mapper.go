@@ -28,7 +28,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/dgrijalva/jwt-go/v4"
+	"github.com/lestrrat-go/jwx/jwa"
+	"github.com/lestrrat-go/jwx/jws"
+	"github.com/lestrrat-go/jwx/jwt"
 	"go.temporal.io/api/serviceerror"
 
 	"go.temporal.io/server/common/config"
@@ -78,20 +80,27 @@ func (a *defaultJWTClaimMapper) GetClaims(authInfo *AuthInfo) (*Claims, error) {
 	if !strings.EqualFold(parts[0], authorizationBearer) {
 		return nil, serviceerror.NewPermissionDenied("unexpected name in authorization token", "")
 	}
-	jwtClaims, err := parseJWTWithAudience(parts[1], a.keyProvider, authInfo.Audience)
+	tok, err := parseJWTWithAudience(parts[1], a.keyProvider, authInfo.Audience)
 	if err != nil {
 		return nil, err
 	}
-	subject, ok := jwtClaims[headerSubject].(string)
+	v, ok := tok.Get(jwt.SubjectKey)
+	if !ok {
+		return nil, serviceerror.NewPermissionDenied(`"sub" claim not present`, "")
+	}
+	subject, ok := v.(string)
 	if !ok {
 		return nil, serviceerror.NewPermissionDenied("unexpected value type of \"sub\" claim", "")
 	}
 	claims.Subject = subject
-	permissions, ok := jwtClaims[a.permissionsClaimName].([]interface{})
+	rawPerms, ok := tok.Get(a.permissionsClaimName)
 	if ok {
-		err := a.extractPermissions(permissions, &claims)
-		if err != nil {
-			return nil, err
+		permissions, ok := rawPerms.([]interface{})
+		if ok {
+			err := a.extractPermissions(permissions, &claims)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 	return &claims, nil
@@ -124,46 +133,67 @@ func (a *defaultJWTClaimMapper) extractPermissions(permissions []interface{}, cl
 	return nil
 }
 
-func parseJWT(tokenString string, keyProvider TokenKeyProvider) (jwt.MapClaims, error) {
+func parseJWT(tokenString string, keyProvider TokenKeyProvider) (jwt.Token, error) {
 	return parseJWTWithAudience(tokenString, keyProvider, "")
 }
 
-func parseJWTWithAudience(tokenString string, keyProvider TokenKeyProvider, audience string) (jwt.MapClaims, error) {
-
-	var parser *jwt.Parser
-	if strings.TrimSpace(audience) == "" {
-		parser = jwt.NewParser(jwt.WithoutAudienceValidation())
-	} else {
-		parser = jwt.NewParser(jwt.WithAudience(audience))
-	}
-	token, err := parser.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-
-		kid, ok := token.Header["kid"].(string)
-		if !ok {
-			return nil, fmt.Errorf("malformed token - no \"kid\" header")
-		}
-		alg := token.Header["alg"].(string)
-		switch token.Method.(type) {
-		case *jwt.SigningMethodHMAC:
-			return keyProvider.HmacKey(alg, kid)
-		case *jwt.SigningMethodRSA:
-			return keyProvider.RsaKey(alg, kid)
-		case *jwt.SigningMethodECDSA:
-			return keyProvider.EcdsaKey(alg, kid)
-		default:
-			return nil, serviceerror.NewPermissionDenied(
-				fmt.Sprintf("unexpected signing method: %v for algorithm: %v", token.Method, token.Header["alg"]), "")
-		}
-	})
-
+func parseJWTWithAudience(tokenString string, keyProvider TokenKeyProvider, audience string) (jwt.Token, error) {
+	msg, err := jws.Parse([]byte(tokenString))
 	if err != nil {
 		return nil, err
 	}
 
-	if claims, ok := token.Claims.(jwt.MapClaims); ok {
-		return claims, nil
+	// A JWS message can contain multiple signatures, but the original code
+	// based on dgrijalva/jwt-go assumed the presence of a single signature.
+	// This code mimics that behavior, and might fail if the user provides
+	// multiple signatures.
+	sigs := msg.Signatures()
+	if len(sigs) == 0 {
+		return nil, fmt.Errorf(`malformed token - no signatures`)
 	}
-	return nil, serviceerror.NewPermissionDenied("invalid token with no claims", "")
+
+	kid := sigs[0].ProtectedHeaders().KeyID()
+	if kid == "" {
+		return nil, fmt.Errorf(`malformed token - no "kid" header`)
+	}
+
+	var key interface{}
+
+	alg := sigs[0].ProtectedHeaders().Algorithm()
+	switch alg {
+	case jwa.ES256, jwa.ES384, jwa.ES512:
+		v, err := keyProvider.EcdsaKey(alg.String(), kid)
+		if err != nil {
+			return nil, err
+		}
+		key = v
+	case jwa.HS256, jwa.HS384, jwa.HS512:
+		v, err := keyProvider.HmacKey(alg.String(), kid)
+		if err != nil {
+			return nil, err
+		}
+		key = v
+	case jwa.PS256, jwa.PS384, jwa.PS512, jwa.RS256, jwa.RS384, jwa.RS512:
+		v, err := keyProvider.RsaKey(alg.String(), kid)
+		if err != nil {
+			return nil, err
+		}
+		key = v
+	default:
+		return nil, serviceerror.NewPermissionDenied(
+			fmt.Sprintf("unexpected signing method: algorithm: %v", alg), "")
+	}
+
+	options := []jwt.ParseOption{jwt.WithVerify(alg, key)}
+	if strings.TrimSpace(audience) != "" {
+		options = append(options, jwt.WithAudience(audience), jwt.WithValidate(true))
+	}
+	tok, err := jwt.Parse([]byte(tokenString), options...)
+	if err != nil {
+		return nil, err
+	}
+
+	return tok, nil
 }
 
 func permissionToRole(permission string) Role {
